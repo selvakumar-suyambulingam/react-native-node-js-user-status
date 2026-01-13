@@ -4,14 +4,14 @@ import { config } from '../config.mjs';
 export class PresenceService {
   client;
   pubClient;
-  subClient;
+  //subClient;
   connected = false;
   presenceListeners = [];
 
   constructor() {
     this.client = createClient({ url: config.redisUrl });
     this.pubClient = createClient({ url: config.redisUrl });
-    this.subClient = createClient({ url: config.redisUrl });
+    //this.subClient = createClient({ url: config.redisUrl });
 
     this.client.on('error', (err) => console.error('Redis error:', err));
     this.client.on('connect', () => {
@@ -29,13 +29,13 @@ export class PresenceService {
 
     await this.client.connect();
     await this.pubClient.connect();
-    await this.subClient.connect();
+    //await this.subClient.connect();
 
     // Pub/Sub for cross-instance updates
-    await this.subClient.subscribe('presence:updates', (message) => {
+    /*await this.subClient.subscribe('presence:updates', (message) => {
       const data = JSON.parse(message);
       this.presenceListeners.forEach((listener) => listener(data));
-    });
+    });*/
 
     // IMPORTANT:
     // No keyspace notifications, no configSet, no expired subscriptions.
@@ -54,12 +54,12 @@ export class PresenceService {
     await this.pubClient.publish('presence:updates', message);
   }
 
-  onPresenceUpdate(callback) {
+  /*onPresenceUpdate(callback) {
     this.presenceListeners.push(callback);
     return () => {
       this.presenceListeners = this.presenceListeners.filter((cb) => cb !== callback);
     };
-  }
+  }*/
 
   normalizeEmail(email) {
     return email.trim().toLowerCase();

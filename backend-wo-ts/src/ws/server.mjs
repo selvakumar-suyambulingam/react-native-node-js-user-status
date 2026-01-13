@@ -11,12 +11,12 @@ export class PresenceWebSocketServer {
 
     this.wss.on('connection', this.handleConnection.bind(this));
 
-    presenceService.onPresenceUpdate((data) => {
+    /*presenceService.onPresenceUpdate((data) => {
       console.log(
         `Received presence update: ${data.email} -> ${data.online ? 'ONLINE' : 'OFFLINE'}`
       );
       this.broadcastPresenceUpdate(data.email, data.online);
-    });
+    });*/
 
     console.log('WebSocket server initialized on /ws');
 
@@ -153,29 +153,6 @@ export class PresenceWebSocketServer {
     }
 
     ws.send(JSON.stringify({ type: 'pong' }));
-  }
-
-  broadcastPresenceUpdate(email, online) {
-    const payload = JSON.stringify({
-      type: 'presence:update',
-      email,
-      online,
-      timestamp: Date.now(),
-    });
-
-    let sent = 0;
-    this.clients.forEach((connections) => {
-      connections.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(payload);
-          sent++;
-        }
-      });
-    });
-
-    console.log(
-      `Broadcasted presence update to ${sent} connection(s): ${email} -> ${online ? 'ONLINE' : 'OFFLINE'}`
-    );
   }
 
   startHeartbeatCheck() {
