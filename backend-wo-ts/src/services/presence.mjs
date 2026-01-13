@@ -9,28 +9,15 @@ export class PresenceService {
   presenceListeners = [];
 
   constructor() {
-    this.client = createClient({
-      url: config.redisUrl,
-    });
+    this.client = createClient({ url: config.redisUrl });
+    this.pubClient = createClient({ url: config.redisUrl });
+    this.subClient = createClient({ url: config.redisUrl });
 
-    // Separate clients for pub/sub
-    this.pubClient = createClient({
-      url: config.redisUrl,
-    });
-
-    this.subClient = createClient({
-      url: config.redisUrl,
-    });
-
-    this.client.on('error', (err) => {
-      console.error('Redis error:', err);
-    });
-
+    this.client.on('error', (err) => console.error('Redis error:', err));
     this.client.on('connect', () => {
       console.log('Connected to Redis');
       this.connected = true;
     });
-
     this.client.on('disconnect', () => {
       console.log('Disconnected from Redis');
       this.connected = false;
@@ -38,233 +25,171 @@ export class PresenceService {
   }
 
   async connect() {
-    if (!this.connected) {
-      await this.client.connect();
-      await this.pubClient.connect();
-      await this.subClient.connect();
+    if (this.connected) return;
 
-      // Subscribe to presence channel
-      await this.subClient.subscribe('presence:updates', (message) => {
-        const data = JSON.parse(message);
-        this.presenceListeners.forEach(listener => listener(data));
-      });
+    await this.client.connect();
+    await this.pubClient.connect();
+    await this.subClient.connect();
 
-      // Enable keyspace notifications for expired keys
-      await this.client.configSet('notify-keyspace-events', 'Ex');
+    // Pub/Sub for cross-instance updates
+    await this.subClient.subscribe('presence:updates', (message) => {
+      const data = JSON.parse(message);
+      this.presenceListeners.forEach((listener) => listener(data));
+    });
 
-      // Subscribe to expired keys for presence TTL
-      await this.subClient.pSubscribe('__keyevent@0__:expired', async (key) => {
-        if (key.startsWith('presence:')) {
-          const email = key.replace('presence:', '');
-          console.log(`User went offline due to TTL expiry: ${email}`);
-
-          // Update last seen
-          await this.updateLastSeen(email);
-
-          // Publish offline event
-          await this.publishPresenceUpdate(email, false);
-        }
-      });
-    }
+    // IMPORTANT:
+    // No keyspace notifications, no configSet, no expired subscriptions.
+    // Offline is determined by TTL expiry naturally (presence key disappears).
   }
 
   async disconnect() {
-    if (this.connected) {
-      await this.subClient.disconnect();
-      await this.pubClient.disconnect();
-      await this.client.disconnect();
-    }
+    if (!this.connected) return;
+    await this.subClient.disconnect();
+    await this.pubClient.disconnect();
+    await this.client.disconnect();
   }
 
-  /**
-   * Publish presence update to Redis Pub/Sub
-   */
   async publishPresenceUpdate(email, online) {
     const message = JSON.stringify({ email, online, timestamp: Date.now() });
     await this.pubClient.publish('presence:updates', message);
   }
 
-  /**
-   * Register a listener for presence updates
-   */
   onPresenceUpdate(callback) {
     this.presenceListeners.push(callback);
     return () => {
-      this.presenceListeners = this.presenceListeners.filter(cb => cb !== callback);
+      this.presenceListeners = this.presenceListeners.filter((cb) => cb !== callback);
     };
   }
 
-  /**
-   * Normalize email: trim and lowercase
-   */
   normalizeEmail(email) {
     return email.trim().toLowerCase();
   }
 
-  /**
-   * Validate email format (must contain @)
-   */
   isValidEmail(email) {
-    return email.includes('@');
+    // Simple but better than includes('@')
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
   }
 
-  /**
-   * Add user to the registered users set
-   */
+  // ---------- Presence (TTL truth) ----------
+  async setOnline(email) {
+    const normalized = this.normalizeEmail(email);
+    const key = `presence:${normalized}`;
+
+    const wasOnline = await this.client.exists(key);
+
+    // Store tiny value + TTL
+    await this.client.set(key, '1', { EX: config.presenceTtlSeconds });
+
+    return wasOnline === 0;
+  }
+
+  async refreshPresence(email) {
+    const normalized = this.normalizeEmail(email);
+
+    // Refresh both presence + connections TTL so crash can’t keep stale count forever
+    const presenceKey = `presence:${normalized}`;
+    const connectionsKey = `connections:${normalized}`;
+
+    // Using MULTI cuts RTTs
+    await this.client
+      .multi()
+      .expire(presenceKey, config.presenceTtlSeconds)
+      .expire(connectionsKey, config.presenceTtlSeconds)
+      .exec();
+  }
+
+  async isOnline(email) {
+    const normalized = this.normalizeEmail(email);
+    const exists = await this.client.exists(`presence:${normalized}`);
+    return exists === 1;
+  }
+
+  // ---------- Last seen ----------
+  async updateLastSeen(email) {
+    const normalized = this.normalizeEmail(email);
+    await this.client.set(`lastseen:${normalized}`, Date.now().toString());
+  }
+
+  async getLastSeen(email) {
+    const normalized = this.normalizeEmail(email);
+    const ts = await this.client.get(`lastseen:${normalized}`);
+    return ts ? parseInt(ts, 10) : null;
+  }
+
+  // ---------- Crash-safe connection count ----------
+  async incrementConnectionCount(email) {
+    const normalized = this.normalizeEmail(email);
+    const key = `connections:${normalized}`;
+
+    const res = await this.client
+      .multi()
+      .incr(key)
+      .expire(key, config.presenceTtlSeconds)
+      .exec();
+
+    // node-redis returns array of results; INCR result is first command
+    const newCount = Number(res?.[0]);
+    return Number.isFinite(newCount) ? newCount : 1;
+  }
+
+  async decrementConnectionCount(email) {
+    const normalized = this.normalizeEmail(email);
+    const key = `connections:${normalized}`;
+
+    const count = await this.client.decr(key);
+
+    // If it goes <= 0, cleanup
+    if (count <= 0) {
+      await this.client.del(key);
+      return 0;
+    }
+
+    // Keep it crash-safe: refresh TTL on decrement too
+    await this.client.expire(key, config.presenceTtlSeconds);
+    return count;
+  }
+
+  async getConnectionCount(email) {
+    const normalized = this.normalizeEmail(email);
+    const val = await this.client.get(`connections:${normalized}`);
+    return val ? parseInt(val, 10) : 0;
+  }
+
+  async setOffline(email) {
+    const normalized = this.normalizeEmail(email);
+
+    await this.updateLastSeen(normalized);
+
+    // Only set offline if no connections remain
+    const count = await this.getConnectionCount(normalized);
+    if (count === 0) {
+      await this.client.del(`presence:${normalized}`);
+      return true;
+    }
+    return false;
+  }
+
+  // Optional helpers you already have:
   async registerUser(email) {
     const normalized = this.normalizeEmail(email);
     await this.client.sAdd('users:all', normalized);
   }
 
-  /**
-   * Get all registered users
-   */
   async getAllUsers() {
-    const users = await this.client.sMembers('users:all');
-    return users;
+    return await this.client.sMembers('users:all');
   }
 
-  /**
-   * Set user as online (with TTL) and return whether status changed
-   * Returns true if user was offline and is now online (status changed)
-   * Returns false if user was already online (no change)
-   */
-  async setOnline(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `presence:${normalized}`;
-
-    // Check if user was already online
-    const wasOnline = await this.client.exists(key);
-
-    // Set online with TTL
-    await this.client.set(key, '1', {
-      EX: config.presenceTtlSeconds,
-    });
-
-    // Return true if status changed (was offline, now online)
-    return wasOnline === 0;
-  }
-
-  /**
-   * Store last seen timestamp for user
-   */
-  async updateLastSeen(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `lastseen:${normalized}`;
-    await this.client.set(key, Date.now().toString());
-  }
-
-  /**
-   * Get last seen timestamp for user
-   */
-  async getLastSeen(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `lastseen:${normalized}`;
-    const timestamp = await this.client.get(key);
-    return timestamp ? parseInt(timestamp, 10) : null;
-  }
-
-  /**
-   * Refresh user presence TTL
-   */
-  async refreshPresence(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `presence:${normalized}`;
-    await this.client.expire(key, config.presenceTtlSeconds);
-  }
-
-  /**
-   * Check if user is online
-   */
-  async isOnline(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `presence:${normalized}`;
-    const exists = await this.client.exists(key);
-    return exists === 1;
-  }
-
-  /**
-   * Increment connection count for user
-   * Returns the new connection count
-   */
-  async incrementConnectionCount(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `connections:${normalized}`;
-    return await this.client.incr(key);
-  }
-
-  /**
-   * Decrement connection count for user
-   * Returns the new connection count
-   */
-  async decrementConnectionCount(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `connections:${normalized}`;
-    const count = await this.client.decr(key);
-
-    // Clean up if count reaches 0
-    if (count <= 0) {
-      await this.client.del(key);
-    }
-
-    return Math.max(0, count);
-  }
-
-  /**
-   * Get connection count for user
-   */
-  async getConnectionCount(email) {
-    const normalized = this.normalizeEmail(email);
-    const key = `connections:${normalized}`;
-    const count = await this.client.get(key);
-    return count ? parseInt(count, 10) : 0;
-  }
-
-  /**
-   * Set user as offline (delete presence key) and update last seen
-   * Only sets offline if no more connections exist
-   */
-  async setOffline(email) {
-    const normalized = this.normalizeEmail(email);
-
-    // Update last seen timestamp
-    await this.updateLastSeen(normalized);
-
-    // Check if there are still active connections
-    const connectionCount = await this.getConnectionCount(normalized);
-
-    // Only set offline if no connections remain
-    if (connectionCount === 0) {
-      const key = `presence:${normalized}`;
-      await this.client.del(key);
-      return true; // Status changed to offline
-    }
-
-    return false; // Still has connections, remains online
-  }
-
-  /**
-   * Get all users with their online status and last seen timestamp
-   */
   async getUsersWithStatus() {
     const users = await this.getAllUsers();
-    const usersWithStatus = await Promise.all(
-      users.map(async (email) => {
-        const online = await this.isOnline(email);
-        const lastSeen = await this.getLastSeen(email);
-        const connectionCount = await this.getConnectionCount(email);
-
-        return {
-          email,
-          online,
-          lastSeen,
-          connectionCount,
-        };
-      })
+    return await Promise.all(
+      users.map(async (email) => ({
+        email,
+        online: await this.isOnline(email),
+        lastSeen: await this.getLastSeen(email),
+        connectionCount: await this.getConnectionCount(email),
+      }))
     );
-    return usersWithStatus;
   }
 }
 
-// Singleton instance
 export const presenceService = new PresenceService();
