@@ -4,12 +4,18 @@ import { config } from '../config.mjs';
 
 export class PresenceWebSocketServer {
   wss;
-  clients = new Map();
+  clients = new Map(); // email -> Set of WebSocket connections
 
   constructor(server) {
     this.wss = new WebSocketServer({ server, path: '/ws' });
 
     this.wss.on('connection', this.handleConnection.bind(this));
+
+    // Listen for presence updates from Redis (other server instances or TTL expiry)
+    presenceService.onPresenceUpdate((data) => {
+      console.log(`Received presence update from Redis: ${data.email} -> ${data.online ? 'ONLINE' : 'OFFLINE'}`);
+      this.broadcastPresenceUpdate(data.email, data.online);
+    });
 
     console.log('WebSocket server initialized on /ws');
   }
@@ -39,10 +45,30 @@ export class PresenceWebSocketServer {
     ws.on('close', async () => {
       console.log(`WebSocket closed for: ${ws.email || 'unknown'}`);
       if (ws.email) {
-        this.clients.delete(ws.email);
-        // Best-effort offline broadcast on clean close
-        await presenceService.setOffline(ws.email);
-        this.broadcastPresenceUpdate(ws.email, false);
+        // Remove this specific connection from the user's connection set
+        const connections = this.clients.get(ws.email);
+        if (connections) {
+          connections.delete(ws);
+
+          // If no more connections for this user, remove from map
+          if (connections.size === 0) {
+            this.clients.delete(ws.email);
+          }
+        }
+
+        // Decrement connection count in Redis
+        const remainingConnections = await presenceService.decrementConnectionCount(ws.email);
+        console.log(`Remaining connections for ${ws.email}: ${remainingConnections}`);
+
+        // Only mark offline and broadcast if this was the last connection
+        if (remainingConnections === 0) {
+          const statusChanged = await presenceService.setOffline(ws.email);
+
+          if (statusChanged) {
+            // Publish to Redis (will be received by all server instances)
+            await presenceService.publishPresenceUpdate(ws.email, false);
+          }
+        }
       }
     });
 
@@ -90,24 +116,41 @@ export class PresenceWebSocketServer {
       return;
     }
 
-    // Authenticate and set online
+    // Authenticate and track connection
     ws.email = normalized;
-    this.clients.set(normalized, ws);
 
-    await presenceService.setOnline(normalized);
+    // Add connection to the set for this user
+    if (!this.clients.has(normalized)) {
+      this.clients.set(normalized, new Set());
+    }
+    this.clients.get(normalized).add(ws);
 
-    console.log(`User authenticated via WebSocket: ${normalized}`);
+    // Increment connection count in Redis
+    const connectionCount = await presenceService.incrementConnectionCount(normalized);
+    console.log(`User authenticated via WebSocket: ${normalized} (${connectionCount} connection${connectionCount > 1 ? 's' : ''})`);
 
-    // Send auth confirmation
+    // Set online and check if status changed (was offline, now online)
+    const statusChanged = await presenceService.setOnline(normalized);
+
+    // Send auth confirmation with last seen info
+    const lastSeen = await presenceService.getLastSeen(normalized);
     ws.send(JSON.stringify({
       type: 'auth:ok',
       email: normalized,
       heartbeatMs: config.heartbeatIntervalMs,
       ttlSeconds: config.presenceTtlSeconds,
+      lastSeen,
+      connectionCount,
     }));
 
-    // Broadcast online status to all clients
-    this.broadcastPresenceUpdate(normalized, true);
+    // Only broadcast if status actually changed (user was offline, now online)
+    if (statusChanged) {
+      console.log(`Status changed for ${normalized}: offline -> online`);
+      // Publish to Redis (will be received by all server instances)
+      await presenceService.publishPresenceUpdate(normalized, true);
+    } else {
+      console.log(`User ${normalized} reconnected (already online, no broadcast)`);
+    }
   }
 
   async handlePing(ws) {
@@ -129,29 +172,47 @@ export class PresenceWebSocketServer {
   }
 
   /**
-   * Broadcast presence update to all connected clients
+   * Broadcast presence update to all connected clients on this server instance
    */
   broadcastPresenceUpdate(email, online) {
     const message = JSON.stringify({
       type: 'presence:update',
       email,
       online,
+      timestamp: Date.now(),
     });
 
-    this.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(message);
-      }
+    let sentCount = 0;
+
+    // Iterate through all users and their connections
+    this.clients.forEach((connections, userEmail) => {
+      connections.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(message);
+          sentCount++;
+        }
+      });
     });
 
-    console.log(`Broadcasted presence update: ${email} -> ${online ? 'ONLINE' : 'OFFLINE'}`);
+    console.log(`Broadcasted presence update to ${sentCount} connection(s): ${email} -> ${online ? 'ONLINE' : 'OFFLINE'}`);
   }
 
   /**
-   * Get all currently connected clients
+   * Get all currently connected user emails on this server instance
    */
   getConnectedEmails() {
     return Array.from(this.clients.keys());
+  }
+
+  /**
+   * Get total number of connections across all users on this server instance
+   */
+  getTotalConnections() {
+    let total = 0;
+    this.clients.forEach((connections) => {
+      total += connections.size;
+    });
+    return total;
   }
 
   /**

@@ -6,7 +6,6 @@ import { presenceService } from './services/presence.mjs';
 import { authRouter } from './routes/auth.mjs';
 import { usersRouter } from './routes/users.mjs';
 import { PresenceWebSocketServer } from './ws/server.mjs';
-import { PresenceSweeper } from './ws/sweeper.mjs';
 
 async function bootstrap() {
   try {
@@ -34,15 +33,11 @@ async function bootstrap() {
     // Create HTTP server
     const server = createServer(app);
 
-    // Initialize WebSocket server
+    // Initialize WebSocket server with Redis Pub/Sub
     const wsServer = new PresenceWebSocketServer(server);
 
     // Start heartbeat check for dead connections
     wsServer.startHeartbeatCheck();
-
-    // Initialize and start presence sweeper
-    const sweeper = new PresenceSweeper(wsServer);
-    sweeper.start();
 
     // Start server
     server.listen(config.port, () => {
@@ -52,14 +47,14 @@ async function bootstrap() {
       console.log(`WebSocket: ws://localhost:${config.port}/ws`);
       console.log(`Heartbeat interval: ${config.heartbeatIntervalMs}ms`);
       console.log(`Presence TTL: ${config.presenceTtlSeconds}s`);
-      console.log(`Sweeper interval: ${config.sweeperIntervalMs}ms`);
+      console.log(`Using Redis Pub/Sub for presence updates`);
+      console.log(`Using Redis keyspace notifications for TTL expiry`);
       console.log('='.repeat(50));
     });
 
     // Graceful shutdown
     const shutdown = async () => {
       console.log('\nShutting down gracefully...');
-      sweeper.stop();
       await presenceService.disconnect();
       server.close(() => {
         console.log('Server closed');

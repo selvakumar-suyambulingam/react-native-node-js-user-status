@@ -5,7 +5,7 @@ export const usersRouter = Router();
 
 /**
  * GET /users
- * Returns: { users: Array<{ email: string, online: boolean }> }
+ * Returns: { users: Array<{ email: string, online: boolean, lastSeen: number | null, connectionCount: number }> }
  */
 usersRouter.get('/users', async (req, res) => {
   try {
