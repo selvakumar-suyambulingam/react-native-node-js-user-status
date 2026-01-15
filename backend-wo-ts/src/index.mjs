@@ -36,9 +36,6 @@ async function bootstrap() {
     // Initialize WebSocket server with Redis Pub/Sub
     const wsServer = new PresenceWebSocketServer(server);
 
-    // Start heartbeat check for dead connections
-    wsServer.startHeartbeatCheck();
-
     // Start server
     server.listen(config.port, () => {
       console.log('='.repeat(50));
