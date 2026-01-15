@@ -1,8 +1,14 @@
 import { config } from '../config';
 
+interface PresenceStatus {
+  email: string;
+  online: boolean;
+}
+
 interface PresenceSocketCallbacks {
   onPresenceUpdate?: (email: string, online: boolean) => void;
   onAuthSuccess?: (email: string, heartbeatMs: number, ttlSeconds: number) => void;
+  onSubscribeSuccess?: (statuses: PresenceStatus[]) => void;
   onError?: (error: string) => void;
   onConnectionChange?: (connected: boolean) => void;
 }
@@ -15,6 +21,13 @@ export class PresenceSocket {
   private callbacks: PresenceSocketCallbacks;
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 5;
+
+  // Track subscribed users for resubscription on reconnect
+  private subscribedUsers: Set<string> = new Set();
+
+  // Queue subscriptions if not yet authenticated
+  private pendingSubscriptions: string[] = [];
+  private isAuthenticated: boolean = false;
 
   constructor(callbacks: PresenceSocketCallbacks) {
     this.callbacks = callbacks;
@@ -92,6 +105,7 @@ export class PresenceSocket {
     console.log('Disconnecting WebSocket');
     this.stopHeartbeat();
     this.reconnectAttempts = this.maxReconnectAttempts; // Prevent auto-reconnect
+    this.isAuthenticated = false;
 
     if (this.ws) {
       this.ws.close();
@@ -99,6 +113,75 @@ export class PresenceSocket {
     }
 
     this.email = null;
+  }
+
+  /**
+   * Subscribe to presence updates for specific users.
+   * Call this after authentication with the user's contact list.
+   * This is the key to scalability - only receive updates for users you care about.
+   */
+  subscribeToUsers(emails: string[]) {
+    if (emails.length === 0) return;
+
+    // Filter out already subscribed users
+    const newEmails = emails.filter((e) => !this.subscribedUsers.has(e.toLowerCase()));
+    if (newEmails.length === 0) return;
+
+    // If not yet authenticated, queue for later
+    if (!this.isAuthenticated || !this.isConnected()) {
+      console.log('Not authenticated yet, queuing subscriptions');
+      this.pendingSubscriptions.push(...newEmails);
+      return;
+    }
+
+    this.send({
+      type: 'subscribe',
+      emails: newEmails,
+    });
+
+    // Add to tracked set
+    newEmails.forEach((e) => this.subscribedUsers.add(e.toLowerCase()));
+  }
+
+  /**
+   * Unsubscribe from specific users' presence updates.
+   * Call this when users are removed from contacts or no longer needed.
+   */
+  unsubscribeFromUsers(emails: string[]) {
+    if (emails.length === 0) return;
+
+    const toRemove = emails.filter((e) => this.subscribedUsers.has(e.toLowerCase()));
+    if (toRemove.length === 0) return;
+
+    if (this.isConnected()) {
+      this.send({
+        type: 'unsubscribe',
+        emails: toRemove,
+      });
+    }
+
+    toRemove.forEach((e) => this.subscribedUsers.delete(e.toLowerCase()));
+  }
+
+  /**
+   * Get list of currently subscribed users
+   */
+  getSubscribedUsers(): string[] {
+    return Array.from(this.subscribedUsers);
+  }
+
+  /**
+   * Clear all subscriptions
+   */
+  clearSubscriptions() {
+    if (this.subscribedUsers.size > 0 && this.isConnected()) {
+      this.send({
+        type: 'unsubscribe',
+        emails: Array.from(this.subscribedUsers),
+      });
+    }
+    this.subscribedUsers.clear();
+    this.pendingSubscriptions = [];
   }
 
   /**
@@ -121,6 +204,14 @@ export class PresenceSocket {
     switch (message.type) {
       case 'auth:ok':
         this.handleAuthSuccess(message);
+        break;
+
+      case 'subscribe:ok':
+        this.handleSubscribeSuccess(message);
+        break;
+
+      case 'unsubscribe:ok':
+        // Unsubscription confirmed
         break;
 
       case 'presence:update':
@@ -149,9 +240,47 @@ export class PresenceSocket {
     console.log(`Authenticated as ${email}, heartbeat: ${heartbeatMs}ms, TTL: ${ttlSeconds}s`);
 
     this.heartbeatMs = heartbeatMs;
+    this.isAuthenticated = true;
     this.startHeartbeat();
 
     this.callbacks.onAuthSuccess?.(email, heartbeatMs, ttlSeconds);
+
+    // Resubscribe to previously subscribed users on reconnect
+    if (this.subscribedUsers.size > 0) {
+      console.log(`Resubscribing to ${this.subscribedUsers.size} users after reconnect`);
+      this.send({
+        type: 'subscribe',
+        emails: Array.from(this.subscribedUsers),
+      });
+    }
+
+    // Process any pending subscriptions that were queued before auth
+    if (this.pendingSubscriptions.length > 0) {
+      console.log(`Processing ${this.pendingSubscriptions.length} pending subscriptions`);
+      const pending = [...this.pendingSubscriptions];
+      this.pendingSubscriptions = [];
+      this.subscribeToUsers(pending);
+    }
+  }
+
+  /**
+   * Handle subscription success - receives initial presence status
+   */
+  private handleSubscribeSuccess(message: any) {
+    const { statuses } = message;
+    console.log(`Subscription confirmed, received ${statuses?.length || 0} statuses`);
+
+    // Notify callback with the statuses
+    if (this.callbacks.onSubscribeSuccess) {
+      this.callbacks.onSubscribeSuccess(statuses || []);
+    }
+
+    // Also trigger individual presence updates for each status
+    if (statuses && Array.isArray(statuses)) {
+      for (const { email, online } of statuses) {
+        this.callbacks.onPresenceUpdate?.(email, online);
+      }
+    }
   }
 
   /**

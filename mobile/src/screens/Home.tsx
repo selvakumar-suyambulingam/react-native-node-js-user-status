@@ -19,6 +19,8 @@ export default function Home() {
   const [currentUser, setCurrentUser] = useState<string | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
 
@@ -61,11 +63,14 @@ export default function Home() {
       setCurrentUser(normalizedEmail);
       setLoggedIn(true);
 
-      // Fetch initial user list
-      await fetchUsers();
+      // Fetch initial user list (paginated - first 50 users)
+      const usersResponse = await getUsers(undefined, 50);
+      const userList = usersResponse.users;
+      setUsers(userList);
+      setHasMore(usersResponse.hasMore || false);
 
-      // Connect to WebSocket
-      connectWebSocket(normalizedEmail);
+      // Connect to WebSocket and pass user list for subscriptions
+      connectWebSocket(normalizedEmail, userList);
 
       setLoading(false);
     } catch (err) {
@@ -75,8 +80,39 @@ export default function Home() {
     }
   };
 
+  const loadMoreUsers = async () => {
+    if (loadingMore || !hasMore || users.length === 0) return;
+
+    setLoadingMore(true);
+    try {
+      const lastUser = users[users.length - 1];
+      const response = await getUsers(lastUser.email, 50);
+
+      if (response.users.length > 0) {
+        setUsers((prev) => [...prev, ...response.users]);
+        setHasMore(response.hasMore || false);
+
+        // Subscribe to new users
+        if (socketRef.current) {
+          const newEmails = response.users
+            .map((u) => u.email)
+            .filter((e) => e !== currentUser);
+          socketRef.current.subscribeToUsers(newEmails);
+        }
+      } else {
+        setHasMore(false);
+      }
+    } catch (err) {
+      console.error('Load more error:', err);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
   const handleLogout = () => {
     if (socketRef.current) {
+      // Clear all subscriptions before disconnecting
+      socketRef.current.clearSubscriptions();
       socketRef.current.disconnect();
       socketRef.current = null;
     }
@@ -86,6 +122,7 @@ export default function Home() {
     setUsers([]);
     setConnected(false);
     setEmail('');
+    setHasMore(false);
   };
 
   const fetchUsers = async () => {
@@ -93,7 +130,7 @@ export default function Home() {
     setUsers(response.users);
   };
 
-  const connectWebSocket = (userEmail: string) => {
+  const connectWebSocket = (userEmail: string, userList: User[]) => {
     const socket = new PresenceSocket({
       onPresenceUpdate: (email, online) => {
         setUsers((prevUsers) => {
@@ -114,6 +151,23 @@ export default function Home() {
       onAuthSuccess: (email, heartbeatMs, ttlSeconds) => {
         console.log(`Auth success: ${email}`);
         setConnected(true);
+
+        // Subscribe to presence updates for all users in the list
+        // This is the key to scalability - only receive updates for users we care about
+        if (userList.length > 0) {
+          const emailsToSubscribe = userList
+            .map((u) => u.email)
+            .filter((e) => e !== email); // Don't subscribe to ourselves
+
+          if (emailsToSubscribe.length > 0) {
+            console.log(`Subscribing to ${emailsToSubscribe.length} users`);
+            socket.subscribeToUsers(emailsToSubscribe);
+          }
+        }
+      },
+      onSubscribeSuccess: (statuses) => {
+        console.log(`Received initial statuses for ${statuses.length} users`);
+        // Statuses are automatically processed via onPresenceUpdate
       },
       onError: (errorMsg) => {
         console.error('WebSocket error:', errorMsg);
@@ -129,14 +183,10 @@ export default function Home() {
   };
 
   const renderUserItem = ({ item }: { item: User }) => {
-    const isCurrentUser = item.email === currentUser;
-
     return (
       <View style={styles.userItem}>
         <View style={styles.userInfo}>
-          <Text style={styles.userEmail}>
-            {item.email} {isCurrentUser && '(You)'}
-          </Text>
+          <Text style={styles.userEmail}>{item.email}</Text>
         </View>
         <View
           style={[
@@ -225,20 +275,36 @@ export default function Home() {
       )}
 
       <FlatList
-        data={users}
+        data={users.filter((u) => u.email !== currentUser)}
         renderItem={renderUserItem}
         keyExtractor={(item) => item.email}
         contentContainerStyle={styles.listContainer}
+        onEndReached={loadMoreUsers}
+        onEndReachedThreshold={0.5}
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>No users yet</Text>
           </View>
         }
+        ListFooterComponent={
+          loadingMore ? (
+            <View style={styles.loadingMore}>
+              <ActivityIndicator size="small" color="#007AFF" />
+              <Text style={styles.loadingMoreText}>Loading more...</Text>
+            </View>
+          ) : hasMore ? (
+            <TouchableOpacity style={styles.loadMoreButton} onPress={loadMoreUsers}>
+              <Text style={styles.loadMoreText}>Load more</Text>
+            </TouchableOpacity>
+          ) : users.length > 0 ? (
+            <Text style={styles.endOfListText}>End of list</Text>
+          ) : null
+        }
       />
 
       <View style={styles.footer}>
         <Text style={styles.footerText}>
-          User status updates in real-time via WebSocket
+          {users.length} users loaded • Real-time updates via WebSocket
         </Text>
       </View>
     </SafeAreaView>
@@ -412,6 +478,32 @@ const styles = StyleSheet.create({
   },
   emptyText: {
     fontSize: 16,
+    color: '#999',
+  },
+  loadingMore: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 16,
+  },
+  loadingMoreText: {
+    marginLeft: 8,
+    fontSize: 14,
+    color: '#666',
+  },
+  loadMoreButton: {
+    padding: 16,
+    alignItems: 'center',
+  },
+  loadMoreText: {
+    fontSize: 14,
+    color: '#007AFF',
+    fontWeight: '600',
+  },
+  endOfListText: {
+    textAlign: 'center',
+    padding: 16,
+    fontSize: 14,
     color: '#999',
   },
   footer: {
