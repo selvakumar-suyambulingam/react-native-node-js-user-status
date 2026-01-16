@@ -25,7 +25,6 @@ export class PresenceService {
 
   async connect() {
     if (this.connected) return;
-
     await Promise.all([this.client.connect(), this.pubClient.connect()]);
     this.connected = true;
   }
@@ -45,160 +44,107 @@ export class PresenceService {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
   }
 
+  // Online truth (TTL)
   presenceKey(email) {
-    return `presence:user:${email}`; // keep prefix stable for clustering
+    return `presence:user:${email}`; // value = serverId, TTL truth
   }
 
+  // "Last seen" (set on offline)
   lastSeenKey(email) {
     return `presence:lastseen:${email}`;
   }
 
-  usersKey() {
-    return 'users:all';
+  // "Active recently" (LinkedIn-style)
+  activeKey(email) {
+    return `presence:active:${email}`; // ms timestamp
   }
 
-  watchersKey(email) {
-    return `presence:watchers:${email}`;
-  }
+  // Pub/Sub sharding for presence flips
+  presenceFlipChannel(email) {
+    const shardCount = config.presenceShardCount ?? 64;
 
-  // ---------------- Subscription/Watcher Management ----------------
-  /**
-   * Subscribe a server to watch a user's presence changes.
-   * Called when a client on this server subscribes to a contact.
-   */
-  async addWatcher(targetEmail, serverId) {
-    const normalized = this.normalizeEmail(targetEmail);
-    const key = this.watchersKey(normalized);
-    await this.client.sAdd(key, serverId);
-    // Set TTL to auto-cleanup stale subscriptions
-    await this.client.expire(key, config.watcherTtlSeconds);
-  }
-
-  /**
-   * Batch subscribe - efficient for initial contact list.
-   * Registers this server as a watcher for multiple users in one pipeline.
-   */
-  async addWatcherBatch(targetEmails, serverId) {
-    if (targetEmails.length === 0) return;
-
-    const pipeline = this.client.multi();
-    for (const email of targetEmails) {
-      const key = this.watchersKey(this.normalizeEmail(email));
-      pipeline.sAdd(key, serverId);
-      pipeline.expire(key, config.watcherTtlSeconds);
+    // Fast deterministic shard (no crypto)
+    let h = 0;
+    for (let i = 0; i < email.length; i++) {
+      h = (h * 31 + email.charCodeAt(i)) >>> 0;
     }
-    await pipeline.exec();
+    const shard = h % shardCount;
+    return `presence:flip:${shard}`;
   }
 
-  /**
-   * Remove server from watchers for a specific user.
-   * Called when no more local clients are watching this user.
-   */
-  async removeWatcher(targetEmail, serverId) {
-    const normalized = this.normalizeEmail(targetEmail);
-    await this.client.sRem(this.watchersKey(normalized), serverId);
+  bucketize(nowMs, lastActiveAtMs, online) {
+    if (online) return 'online_now';
+    if (!lastActiveAtMs) return 'unknown';
+
+    const d = nowMs - lastActiveAtMs;
+    if (d < 10_000) return 'active_10s';
+    if (d < 60_000) return 'active_1m';
+    if (d < 5 * 60_000) return 'active_5m';
+    if (d < 15 * 60_000) return 'active_15m';
+    if (d < 60 * 60_000) return 'active_1h';
+    if (d < 24 * 60 * 60_000) return 'active_today';
+    return 'inactive';
   }
 
-  /**
-   * Batch remove watchers - efficient cleanup on server shutdown.
-   */
-  async removeWatcherBatch(targetEmails, serverId) {
-    if (targetEmails.length === 0) return;
-
-    const pipeline = this.client.multi();
-    for (const email of targetEmails) {
-      pipeline.sRem(this.watchersKey(this.normalizeEmail(email)), serverId);
-    }
-    await pipeline.exec();
-  }
-
-  /**
-   * Get all servers watching a user (for targeted broadcast).
-   */
-  async getWatchers(email) {
+  // ---------------- Activity (LinkedIn-style) ----------------
+  async touchActive(email) {
     const normalized = this.normalizeEmail(email);
-    return await this.client.sMembers(this.watchersKey(normalized));
+    const now = Date.now();
+    await this.client.set(this.activeKey(normalized), String(now));
+    return now;
   }
 
-  // ---------------- Pub/Sub ----------------
-  /**
-   * Publish presence update to ALL servers (legacy - for backward compatibility).
-   * Prefer publishTargetedPresenceUpdate for scale.
-   */
-  async publishPresenceUpdate(email, online) {
-    const message = JSON.stringify({ email, online, timestamp: Date.now() });
-    await this.pubClient.publish(config.presenceChannel, message);
-  }
-
-  /**
-   * Publish presence update ONLY to interested servers.
-   * This is the scalable approach - only servers with subscribed clients receive the update.
-   */
-  async publishTargetedPresenceUpdate(email, online) {
+  // ---------------- Pub/Sub (presence flips only) ----------------
+  async publishPresenceFlip(email, online) {
     const normalized = this.normalizeEmail(email);
-    const watchers = await this.getWatchers(normalized);
+    const channel = this.presenceFlipChannel(normalized);
 
-    // If no servers are watching, skip publishing
-    if (watchers.length === 0) return;
-
-    const message = JSON.stringify({
+    const msg = JSON.stringify({
       email: normalized,
       online,
-      timestamp: Date.now(),
-      targetServers: watchers
+      ts: Date.now(),
     });
 
-    await this.pubClient.publish(config.presenceChannel, message);
-  }
-
-  /**
-   * Get batch presence status - efficient for initial subscription load.
-   * Uses pipeline to fetch presence for multiple users in one round-trip.
-   */
-  async getBatchPresence(emails) {
-    if (emails.length === 0) return [];
-
-    const pipeline = this.client.multi();
-    const normalized = emails.map((e) => this.normalizeEmail(e));
-
-    for (const email of normalized) {
-      pipeline.exists(this.presenceKey(email));
-    }
-
-    const results = await pipeline.exec();
-    return normalized.map((email, i) => ({
-      email,
-      online: results[i] === 1
-    }));
+    await this.pubClient.publish(channel, msg);
   }
 
   // ---------------- Presence (TTL truth + ownership) ----------------
   /**
-   * Set online by writing presence key with TTL.
-   * Value = serverId that "owns" the socket(s) right now.
-   *
-   * Returns { statusChanged, lastSeen }
-   * statusChanged = true if user was previously offline (key missing)
+   * Set online with TTL. Value is serverId.
+   * Returns { statusChanged, lastSeen } where statusChanged = offline -> online transition.
    */
   async setOnline(email, serverId) {
     const normalized = this.normalizeEmail(email);
     const key = this.presenceKey(normalized);
 
-    // Redis 6.2+: SET ... GET returns previous value (or null if key was absent)
-    const prev = await this.client.set(key, serverId, {
+    // Pipeline to reduce round trips.
+    const now = Date.now();
+    const pipeline = this.client.multi();
+
+    // Update "active" whenever user authenticates/comes online
+    pipeline.set(this.activeKey(normalized), String(now));
+
+    // SET ... GET returns previous value (null if absent)
+    pipeline.set(key, serverId, {
       EX: config.presenceTtlSeconds,
       GET: true,
     });
 
-    const statusChanged = prev === null;
-    const lastSeen = await this.getLastSeen(normalized);
+    pipeline.get(this.lastSeenKey(normalized));
 
-    return { statusChanged, lastSeen };
+    const res = await pipeline.exec();
+
+    const prev = res?.[1] ?? null;
+    const lastSeenRaw = res?.[2] ?? null;
+
+    return {
+      statusChanged: prev === null,
+      lastSeen: lastSeenRaw ? Number(lastSeenRaw) : null,
+    };
   }
 
   /**
-   * Refresh TTL ONLY if this server still owns the presence key.
-   * Prevents stale server from extending presence after reconnect on another server.
+   * Refresh TTL only if this server still owns the key.
    */
   async refreshPresence(email, serverId) {
     const normalized = this.normalizeEmail(email);
@@ -219,15 +165,13 @@ export class PresenceService {
   }
 
   /**
-   * Mark offline safely (optional optimization).
-   * Only deletes if this server still owns the key.
-   * You do NOT need to call this for correctness; TTL handles offline.
+   * Optional optimization: mark offline early.
+   * Only deletes if server still owns key.
    */
   async safeClearIfOwned(email, serverId) {
     const normalized = this.normalizeEmail(email);
     const key = this.presenceKey(normalized);
 
-    // Update last seen when we *believe* they went offline
     await this.updateLastSeen(normalized);
 
     const script = `
@@ -243,13 +187,13 @@ export class PresenceService {
       arguments: [serverId],
     });
 
-    return res === 1;
+    return Number(res) === 1;
   }
 
   async isOnline(email) {
     const normalized = this.normalizeEmail(email);
-    const exists = await this.client.exists(this.presenceKey(normalized));
-    return exists === 1;
+    const serverId = await this.client.get(this.presenceKey(normalized));
+    return Boolean(serverId);
   }
 
   // ---------------- Last seen ----------------
@@ -264,7 +208,55 @@ export class PresenceService {
     return ts ? Number(ts) : null;
   }
 
+  // ---------------- Batch reads for list (FAST) ----------------
+  /**
+   * Fetch presence for visible window / buffer.
+   * Returns { email, online, lastActiveAt, bucket }.
+   *
+   * Call this from HTTP endpoint /presence/batch (or WS snapshot).
+   */
+  async getBatchPresenceForList(emails) {
+    if (!emails || emails.length === 0) return [];
+
+    const normalized = [];
+    for (const e of emails) {
+      const ne = this.normalizeEmail(e);
+      if (ne && this.isValidEmail(ne)) normalized.push(ne);
+    }
+    if (normalized.length === 0) return [];
+
+    const pipeline = this.client.multi();
+
+    // GET presence value (serverId) to know online
+    for (const email of normalized) pipeline.get(this.presenceKey(email));
+    // GET lastActiveAt
+    for (const email of normalized) pipeline.get(this.activeKey(email));
+
+    const res = await pipeline.exec();
+    const n = normalized.length;
+    const now = Date.now();
+
+    return normalized.map((email, i) => {
+      const onlineServerId = res?.[i] ?? null;
+      const lastActiveRaw = res?.[n + i] ?? null;
+
+      const online = Boolean(onlineServerId);
+      const lastActiveAt = lastActiveRaw ? Number(lastActiveRaw) : null;
+
+      return {
+        email,
+        online,
+        lastActiveAt,
+        bucket: this.bucketize(now, lastActiveAt, online),
+      };
+    });
+  }
+
   // ---------------- User registry (demo) ----------------
+  usersKey() {
+    return 'users:all';
+  }
+
   async registerUser(email) {
     const normalized = this.normalizeEmail(email);
     await this.client.sAdd(this.usersKey(), normalized);
@@ -272,131 +264,6 @@ export class PresenceService {
 
   async getAllUsers() {
     return await this.client.sMembers(this.usersKey());
-  }
-
-  /**
-   * DEPRECATED: Use getUsersPaginated or getBatchPresenceWithLastSeen instead.
-   * This method fetches ALL users and won't scale beyond ~10K users.
-   */
-  async getUsersWithStatus() {
-    const users = await this.getAllUsers();
-    if (users.length === 0) return [];
-
-    const pipeline = this.client.multi();
-
-    // 1) EXISTS all presence keys
-    for (const email of users) pipeline.exists(this.presenceKey(email));
-
-    // 2) GET all lastSeen keys
-    for (const email of users) pipeline.get(this.lastSeenKey(email));
-
-    // node-redis multi.exec() returns array of raw results in order
-    const res = await pipeline.exec();
-    const n = users.length;
-
-    const existsResults = res.slice(0, n).map((x) => Number(x));
-    const lastSeenResults = res
-      .slice(n, 2 * n)
-      .map((x) => (x == null ? null : Number(x)));
-
-    return users.map((email, i) => ({
-      email,
-      online: existsResults[i] === 1,
-      lastSeen: lastSeenResults[i],
-    }));
-  }
-
-  // ---------------- Scalable Methods for 1M+ users ----------------
-
-  /**
-   * Get batch presence with lastSeen - SCALABLE.
-   * Use this for fetching presence of specific users (contacts list).
-   * Limited to 500 users per call for safety.
-   */
-  async getBatchPresenceWithLastSeen(emails) {
-    if (emails.length === 0) return [];
-
-    const normalized = emails.map((e) => this.normalizeEmail(e));
-    const pipeline = this.client.multi();
-
-    // Batch EXISTS for presence
-    for (const email of normalized) {
-      pipeline.exists(this.presenceKey(email));
-    }
-
-    // Batch GET for lastSeen
-    for (const email of normalized) {
-      pipeline.get(this.lastSeenKey(email));
-    }
-
-    const results = await pipeline.exec();
-    const n = normalized.length;
-
-    return normalized.map((email, i) => ({
-      email,
-      online: results[i] === 1,
-      lastSeen: results[n + i] ? Number(results[n + i]) : null
-    }));
-  }
-
-  /**
-   * Get users with pagination using SSCAN - SCALABLE.
-   * Use cursor-based pagination for large user sets.
-   * Returns { users, nextCursor, hasMore }
-   */
-  async getUsersPaginated(cursor, limit = 50) {
-    const key = this.usersKey();
-
-    // Use SSCAN for cursor-based iteration
-    // cursor is the email to start after (or null for start)
-    let emails = [];
-    let scanCursor = 0;
-    const targetCount = limit + 1; // Fetch one extra to check hasMore
-
-    // SSCAN doesn't support "start after X", so we use ZRANGEBYLEX with sorted set
-    // For simplicity with SET, we'll use SSCAN and skip until we find cursor
-    // In production, consider using ZSET for ordered pagination
-
-    // Simple approach: fetch in batches until we have enough
-    let foundCursor = !cursor; // If no cursor, we start from beginning
-    let iterations = 0;
-    const maxIterations = 100; // Safety limit
-
-    while (emails.length < targetCount && iterations < maxIterations) {
-      // node-redis v4 returns { cursor: number, members: string[] }
-      const result = await this.client.sScan(key, scanCursor, {
-        COUNT: Math.max(100, targetCount * 2)
-      });
-
-      for (const email of result.members) {
-        if (!foundCursor) {
-          if (email === cursor) {
-            foundCursor = true;
-          }
-          continue;
-        }
-
-        emails.push(email);
-        if (emails.length >= targetCount) break;
-      }
-
-      scanCursor = result.cursor;
-      if (scanCursor === 0) break; // Completed full scan
-      iterations++;
-    }
-
-    const hasMore = emails.length > limit;
-    const resultEmails = emails.slice(0, limit);
-
-    if (resultEmails.length === 0) {
-      return { users: [], nextCursor: null, hasMore: false };
-    }
-
-    // Batch fetch presence for result set
-    const users = await this.getBatchPresenceWithLastSeen(resultEmails);
-    const nextCursor = hasMore ? resultEmails[resultEmails.length - 1] : null;
-
-    return { users, nextCursor, hasMore };
   }
 }
 

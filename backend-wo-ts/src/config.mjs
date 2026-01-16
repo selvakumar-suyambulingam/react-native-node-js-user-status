@@ -6,23 +6,30 @@ dotenv.config();
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
-  heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS || '15000', 10),
-  presenceTtlSeconds: parseInt(process.env.PRESENCE_TTL_SECONDS || '90', 10),
+
+  // Heartbeat: no need to be super aggressive. 30-60s is typical.
+  heartbeatIntervalMs: parseInt(process.env.HEARTBEAT_INTERVAL_MS || '45000', 10),
+
+  // Presence TTL should be > heartbeat (2x is a decent start)
+  presenceTtlSeconds: parseInt(process.env.PRESENCE_TTL_SECONDS || '120', 10),
 
   // Unique server ID for multi-server deployments
-  // Use stable ID from env for production, random for dev
   serverId: process.env.SERVER_ID || crypto.randomUUID(),
 
-  // Subscription limits to prevent abuse
-  maxSubscriptionsPerClient: parseInt(process.env.MAX_SUBSCRIPTIONS_PER_CLIENT || '500', 10),
+  // ---- Focus/Blur (realtime window) ----
+  // Cap realtime per socket. Visible list is ~8, buffer maybe 50, open chat 1 => 100 is safe.
+  maxFocusPerClient: parseInt(process.env.MAX_FOCUS_PER_CLIENT || '100', 10),
 
-  // Watcher TTL - auto-cleanup stale server subscriptions
-  watcherTtlSeconds: parseInt(process.env.WATCHER_TTL_SECONDS || '3600', 10),
+  // Rate limiting focus calls
+  focusRateLimitPerMinute: parseInt(process.env.FOCUS_RATE_LIMIT_PER_MINUTE || '60', 10),
 
-  // Pub/Sub channel name
+  // ---- Pub/Sub flip shards ----
+  // Local: set to 1. Prod: 32/64.
+  presenceShardCount: parseInt(process.env.PRESENCE_SHARD_COUNT || '1', 10),
+
+  // (Optional) keep your legacy channel if you still have old code paths
   presenceChannel: process.env.PRESENCE_CHANNEL || 'presence:updates',
 
-  // Rate limiting
+  // Connection rate limiting
   maxConnectionsPerIp: parseInt(process.env.MAX_CONNECTIONS_PER_IP || '10', 10),
-  subscribeRateLimitPerMinute: parseInt(process.env.SUBSCRIBE_RATE_LIMIT || '60', 10)
 };

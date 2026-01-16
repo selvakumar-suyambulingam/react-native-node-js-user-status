@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   StyleSheet,
   Text,
@@ -10,8 +10,54 @@ import {
   SafeAreaView,
   StatusBar,
 } from 'react-native';
-import { login, getUsers, User } from '../services/api';
+
+import * as api from '../services/api';
 import { PresenceSocket } from '../services/presenceSocket';
+
+type User = api.User;
+
+// Helpers: label from bucket
+function bucketToLabel(bucket?: string | null) {
+  if (!bucket) return null;
+
+  // Normalize common buckets
+  switch (bucket) {
+    case 'active_now':
+      return 'ACTIVE NOW';
+    case 'active_5m':
+      return 'ACTIVE 5M';
+    case 'active_15m':
+      return 'ACTIVE 15M';
+    case 'active_1h':
+      return 'ACTIVE 1H';
+    case 'active_24h':
+      return 'ACTIVE TODAY';
+    case 'inactive':
+      return null;
+    default:
+      return String(bucket).replaceAll('_', ' ').toUpperCase();
+  }
+}
+
+// IMPORTANT: online overrides bucket always
+function getPresenceDisplay(u: any): { label: string; badge: any } {
+  const online = u?.online;
+
+  if (online === true) {
+    return { label: 'ONLINE', badge: styles.statusOnline };
+  }
+
+  const activeLabel = bucketToLabel(u?.bucket);
+  if (activeLabel) {
+    return { label: activeLabel, badge: styles.statusActive };
+  }
+
+  if (online === false) {
+    return { label: 'OFFLINE', badge: styles.statusOffline };
+  }
+
+  return { label: '…', badge: styles.statusUnknown };
+}
 
 export default function Home() {
   const [email, setEmail] = useState('');
@@ -26,21 +72,114 @@ export default function Home() {
 
   const socketRef = useRef<PresenceSocket | null>(null);
 
+  // Focus window tracking
+  const focusSetRef = useRef<Set<string>>(new Set());
+  const usersRef = useRef<User[]>([]);
+  const currentUserRef = useRef<string | null>(null);
+
+  // Tune these
+  const FOCUS_BUFFER_COUNT = 30;
+  const MAX_FOCUS_PER_CLIENT = 100;
+  const PULL_REFRESH_MS = 10_000;
+
   useEffect(() => {
-    // Cleanup on unmount
+    usersRef.current = Array.isArray(users) ? users : [];
+  }, [users]);
+
+  useEffect(() => {
+    currentUserRef.current = currentUser ?? null;
+  }, [currentUser]);
+
+  useEffect(() => {
     return () => {
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-      }
+      if (socketRef.current) socketRef.current.disconnect();
     };
   }, []);
+
+  // Merge incoming user objects by email (preserve existing fields)
+  const mergeUsers = useCallback((incoming: any[]) => {
+    if (!Array.isArray(incoming) || incoming.length === 0) return;
+
+    setUsers((prev) => {
+      const p = Array.isArray(prev) ? prev : [];
+      const map = new Map<string, any>(p.map((u) => [u.email, u]));
+
+      for (const inc of incoming) {
+        if (!inc?.email) continue;
+
+        const existing = map.get(inc.email) || { email: inc.email };
+
+        // Only overwrite fields that are present on incoming.
+        // This prevents accidental "bucket disappears" or "online becomes false" from undefined.
+        const merged: any = { ...existing };
+
+        if ('online' in inc) merged.online = inc.online;
+        if ('bucket' in inc) merged.bucket = inc.bucket;
+        if ('lastActiveAt' in inc) merged.lastActiveAt = inc.lastActiveAt;
+        if ('lastSeen' in inc) merged.lastSeen = inc.lastSeen;
+
+        map.set(inc.email, merged);
+      }
+
+      return Array.from(map.values());
+    });
+  }, []);
+
+  const applyFocusDelta = useCallback((nextEmails: string[]) => {
+    const socket = socketRef.current;
+    if (!socket) return;
+
+    const nextSet = new Set(nextEmails);
+    const prevSet = focusSetRef.current;
+
+    const toFocus: string[] = [];
+    const toBlur: string[] = [];
+
+    for (const e of nextSet) if (!prevSet.has(e)) toFocus.push(e);
+    for (const e of prevSet) if (!nextSet.has(e)) toBlur.push(e);
+
+    focusSetRef.current = nextSet;
+
+    if (toFocus.length) socket.focus(toFocus);
+    if (toBlur.length) socket.blur(toBlur);
+  }, []);
+
+  const connectWebSocket = (userEmail: string) => {
+    const socket = new PresenceSocket({
+      onPresenceUpdate: (changedEmail: string, online: boolean) => {
+        // WS pushes only online/offline
+        mergeUsers([{ email: changedEmail, online }]);
+      },
+
+      onAuthSuccess: () => {
+        setConnected(true);
+        // Focus is driven by viewability.
+      },
+
+      // If your server returns snapshot on focus:ok, merge it
+      onFocusSuccess: (usersOrStatuses?: any[]) => {
+        if (Array.isArray(usersOrStatuses)) mergeUsers(usersOrStatuses);
+      },
+
+      onError: (errorMsg: string) => {
+        console.error('WebSocket error:', errorMsg);
+        setError(errorMsg);
+      },
+
+      onConnectionChange: (isConnected: boolean) => {
+        setConnected(isConnected);
+      },
+    });
+
+    socket.connect(userEmail);
+    socketRef.current = socket;
+  };
 
   const handleLogin = async () => {
     if (!email.trim()) {
       setError('Please enter an email');
       return;
     }
-
     if (!email.includes('@')) {
       setError('Please enter a valid email');
       return;
@@ -50,12 +189,9 @@ export default function Home() {
     setError(null);
 
     try {
-      // Call login API
-      const response = await login(email.trim());
-
-      if (!response.ok) {
-        setError(response.error || 'Login failed');
-        setLoading(false);
+      const response = await api.login(email.trim());
+      if (!response?.ok) {
+        setError(response?.error || 'Login failed');
         return;
       }
 
@@ -63,42 +199,37 @@ export default function Home() {
       setCurrentUser(normalizedEmail);
       setLoggedIn(true);
 
-      // Fetch initial user list (paginated - first 50 users)
-      const usersResponse = await getUsers(undefined, 50);
-      const userList = usersResponse.users;
+      const usersResponse = await api.getUsers(undefined, 50);
+      const userList = Array.isArray(usersResponse?.users) ? usersResponse.users : [];
+
       setUsers(userList);
-      setHasMore(usersResponse.hasMore || false);
+      setHasMore(Boolean(usersResponse?.hasMore));
 
-      // Connect to WebSocket and pass user list for subscriptions
-      connectWebSocket(normalizedEmail, userList);
-
-      setLoading(false);
+      connectWebSocket(normalizedEmail);
     } catch (err) {
       console.error('Login error:', err);
       setError('An error occurred during login');
+    } finally {
       setLoading(false);
     }
   };
 
   const loadMoreUsers = async () => {
-    if (loadingMore || !hasMore || users.length === 0) return;
+    const safeUsers = Array.isArray(users) ? users : [];
+    if (loadingMore || !hasMore || safeUsers.length === 0) return;
 
     setLoadingMore(true);
     try {
-      const lastUser = users[users.length - 1];
-      const response = await getUsers(lastUser.email, 50);
+      const lastUser = safeUsers[safeUsers.length - 1];
+      const response = await api.getUsers(lastUser.email, 50);
 
-      if (response.users.length > 0) {
-        setUsers((prev) => [...prev, ...response.users]);
-        setHasMore(response.hasMore || false);
-
-        // Subscribe to new users
-        if (socketRef.current) {
-          const newEmails = response.users
-            .map((u) => u.email)
-            .filter((e) => e !== currentUser);
-          socketRef.current.subscribeToUsers(newEmails);
-        }
+      const nextUsers = Array.isArray(response?.users) ? response.users : [];
+      if (nextUsers.length > 0) {
+        setUsers((prev) => {
+          const p = Array.isArray(prev) ? prev : [];
+          return [...p, ...nextUsers];
+        });
+        setHasMore(Boolean(response?.hasMore));
       } else {
         setHasMore(false);
       }
@@ -110,10 +241,12 @@ export default function Home() {
   };
 
   const handleLogout = () => {
-    if (socketRef.current) {
-      // Clear all subscriptions before disconnecting
-      socketRef.current.clearSubscriptions();
-      socketRef.current.disconnect();
+    const socket = socketRef.current;
+    if (socket) {
+      const focused = Array.from(focusSetRef.current);
+      if (focused.length) socket.blur(focused);
+      focusSetRef.current = new Set();
+      socket.disconnect();
       socketRef.current = null;
     }
 
@@ -125,78 +258,84 @@ export default function Home() {
     setHasMore(false);
   };
 
-  const fetchUsers = async () => {
-    const response = await getUsers();
-    setUsers(response.users);
-  };
+  // Viewability-driven focus window (visible + buffer)
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 50 });
 
-  const connectWebSocket = (userEmail: string, userList: User[]) => {
-    const socket = new PresenceSocket({
-      onPresenceUpdate: (email, online) => {
-        setUsers((prevUsers) => {
-          // Check if user exists in the list
-          const userExists = prevUsers.some((u) => u.email === email);
+  const onViewableItemsChanged = useRef(({ viewableItems }: any) => {
+    const me = currentUserRef.current;
+    const all = usersRef.current;
 
-          if (userExists) {
-            // Update existing user
-            return prevUsers.map((u) =>
-              u.email === email ? { ...u, online } : u
-            );
-          } else {
-            // Add new user
-            return [...prevUsers, { email, online }];
-          }
-        });
-      },
-      onAuthSuccess: (email, heartbeatMs, ttlSeconds) => {
-        console.log(`Auth success: ${email}`);
-        setConnected(true);
+    const visibleEmails: string[] = (viewableItems || [])
+      .map((v: any) => v?.item?.email)
+      .filter(Boolean)
+      .filter((e: string) => e !== me);
 
-        // Subscribe to presence updates for all users in the list
-        // This is the key to scalability - only receive updates for users we care about
-        if (userList.length > 0) {
-          const emailsToSubscribe = userList
-            .map((u) => u.email)
-            .filter((e) => e !== email); // Don't subscribe to ourselves
+    const lastIndex = Math.max(
+      ...(viewableItems || []).map((v: any) => (typeof v?.index === 'number' ? v.index : -1)),
+      -1
+    );
 
-          if (emailsToSubscribe.length > 0) {
-            console.log(`Subscribing to ${emailsToSubscribe.length} users`);
-            socket.subscribeToUsers(emailsToSubscribe);
-          }
-        }
-      },
-      onSubscribeSuccess: (statuses) => {
-        console.log(`Received initial statuses for ${statuses.length} users`);
-        // Statuses are automatically processed via onPresenceUpdate
-      },
-      onError: (errorMsg) => {
-        console.error('WebSocket error:', errorMsg);
-        setError(errorMsg);
-      },
-      onConnectionChange: (isConnected) => {
-        setConnected(isConnected);
-      },
-    });
+    const buffer: string[] = [];
+    for (let i = lastIndex + 1; i < Math.min(all.length, lastIndex + 1 + FOCUS_BUFFER_COUNT); i++) {
+      const e = all[i]?.email;
+      if (e && e !== me) buffer.push(e);
+    }
 
-    socket.connect(userEmail);
-    socketRef.current = socket;
-  };
+    const combined = [...new Set([...visibleEmails, ...buffer])].slice(0, MAX_FOCUS_PER_CLIENT);
+    applyFocusDelta(combined);
+  }).current;
 
-  const renderUserItem = ({ item }: { item: User }) => {
+  // 10s pull refresh for focused window (TTL expiry becomes visible here)
+  useEffect(() => {
+    let timer: any = null;
+    let cancelled = false;
+
+    const tick = async () => {
+      const getPresenceBatch = (api as any).getPresenceBatch;
+      if (typeof getPresenceBatch !== 'function') return;
+
+      const emails = Array.from(focusSetRef.current);
+      if (emails.length === 0) return;
+
+      try {
+        const result = await getPresenceBatch(emails);
+        if (cancelled) return;
+
+        // Your backend returns: { users: [...] } OR just [...]
+        const arr = Array.isArray(result) ? result : Array.isArray(result?.users) ? result.users : [];
+        if (arr.length === 0) return;
+
+        mergeUsers(arr);
+      } catch {
+        // best effort
+      }
+    };
+
+    if (loggedIn) {
+      tick();
+      timer = setInterval(tick, PULL_REFRESH_MS);
+    }
+
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [loggedIn, mergeUsers]);
+
+  const renderUserItem = ({ item }: { item: any }) => {
+    const { label, badge } = getPresenceDisplay(item);
+
     return (
       <View style={styles.userItem}>
         <View style={styles.userInfo}>
-          <Text style={styles.userEmail}>{item.email}</Text>
+          <Text style={styles.userEmail}>{item?.email}</Text>
+
+          {/* Optional debug line: comment out when done */}
+          {/* <Text style={styles.debugText}>{`online=${String(item?.online)} bucket=${String(item?.bucket)}`}</Text> */}
         </View>
-        <View
-          style={[
-            styles.statusBadge,
-            item.online ? styles.statusOnline : styles.statusOffline,
-          ]}
-        >
-          <Text style={styles.statusText}>
-            {item.online ? 'ONLINE' : 'OFFLINE'}
-          </Text>
+
+        <View style={[styles.statusBadge, badge]}>
+          <Text style={styles.statusText}>{label}</Text>
         </View>
       </View>
     );
@@ -223,25 +362,17 @@ export default function Home() {
 
           {error && <Text style={styles.errorText}>{error}</Text>}
 
-          <TouchableOpacity
-            style={[styles.button, loading && styles.buttonDisabled]}
-            onPress={handleLogin}
-            disabled={loading}
-          >
-            {loading ? (
-              <ActivityIndicator color="#fff" />
-            ) : (
-              <Text style={styles.buttonText}>Login</Text>
-            )}
+          <TouchableOpacity style={[styles.button, loading && styles.buttonDisabled]} onPress={handleLogin} disabled={loading}>
+            {loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Login</Text>}
           </TouchableOpacity>
 
-          <Text style={styles.infoText}>
-            No password required. Just enter any email with @ symbol.
-          </Text>
+          <Text style={styles.infoText}>No password required. Just enter any email with @ symbol.</Text>
         </View>
       </SafeAreaView>
     );
   }
+
+  const safeUsers = Array.isArray(users) ? users : [];
 
   return (
     <SafeAreaView style={styles.container}>
@@ -257,15 +388,8 @@ export default function Home() {
       </View>
 
       <View style={styles.connectionStatus}>
-        <View
-          style={[
-            styles.connectionDot,
-            connected ? styles.connectionDotConnected : styles.connectionDotDisconnected,
-          ]}
-        />
-        <Text style={styles.connectionText}>
-          {connected ? 'Connected' : 'Disconnected'}
-        </Text>
+        <View style={[styles.connectionDot, connected ? styles.connectionDotConnected : styles.connectionDotDisconnected]} />
+        <Text style={styles.connectionText}>{connected ? 'Connected' : 'Disconnected'}</Text>
       </View>
 
       {error && (
@@ -275,12 +399,14 @@ export default function Home() {
       )}
 
       <FlatList
-        data={users.filter((u) => u.email !== currentUser)}
+        data={safeUsers.filter((u: any) => u?.email && u.email !== currentUser)}
         renderItem={renderUserItem}
-        keyExtractor={(item) => item.email}
+        keyExtractor={(item: any) => item.email}
         contentContainerStyle={styles.listContainer}
         onEndReached={loadMoreUsers}
         onEndReachedThreshold={0.5}
+        onViewableItemsChanged={onViewableItemsChanged}
+        viewabilityConfig={viewabilityConfig.current}
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
             <Text style={styles.emptyText}>No users yet</Text>
@@ -296,43 +422,24 @@ export default function Home() {
             <TouchableOpacity style={styles.loadMoreButton} onPress={loadMoreUsers}>
               <Text style={styles.loadMoreText}>Load more</Text>
             </TouchableOpacity>
-          ) : users.length > 0 ? (
+          ) : safeUsers.length > 0 ? (
             <Text style={styles.endOfListText}>End of list</Text>
           ) : null
         }
       />
 
       <View style={styles.footer}>
-        <Text style={styles.footerText}>
-          {users.length} users loaded • Real-time updates via WebSocket
-        </Text>
+        <Text style={styles.footerText}>{safeUsers.length} users loaded • Focus + 10s pull refresh</Text>
       </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#f5f5f5',
-  },
-  loginContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-  },
-  title: {
-    fontSize: 32,
-    fontWeight: 'bold',
-    marginBottom: 8,
-    color: '#333',
-  },
-  subtitle: {
-    fontSize: 16,
-    color: '#666',
-    marginBottom: 32,
-  },
+  container: { flex: 1, backgroundColor: '#f5f5f5' },
+  loginContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+  title: { fontSize: 32, fontWeight: 'bold', marginBottom: 8, color: '#333' },
+  subtitle: { fontSize: 16, color: '#666', marginBottom: 32 },
   input: {
     width: '100%',
     height: 50,
@@ -353,25 +460,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 16,
   },
-  buttonDisabled: {
-    opacity: 0.6,
-  },
-  buttonText: {
-    color: '#fff',
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  errorText: {
-    color: '#ff3b30',
-    fontSize: 14,
-    marginBottom: 12,
-    textAlign: 'center',
-  },
-  infoText: {
-    fontSize: 14,
-    color: '#999',
-    textAlign: 'center',
-  },
+  buttonDisabled: { opacity: 0.6 },
+  buttonText: { color: '#fff', fontSize: 18, fontWeight: '600' },
+  errorText: { color: '#ff3b30', fontSize: 14, marginBottom: 12, textAlign: 'center' },
+  infoText: { fontSize: 14, color: '#999', textAlign: 'center' },
+
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -381,59 +474,20 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: '#e0e0e0',
   },
-  headerTitle: {
-    fontSize: 24,
-    fontWeight: 'bold',
-    color: '#333',
-  },
-  headerSubtitle: {
-    fontSize: 14,
-    color: '#666',
-    marginTop: 2,
-  },
-  logoutButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: '#007AFF',
-  },
-  logoutButtonText: {
-    color: '#007AFF',
-    fontSize: 14,
-    fontWeight: '600',
-  },
-  connectionStatus: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: '#fff',
-  },
-  connectionDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 8,
-  },
-  connectionDotConnected: {
-    backgroundColor: '#34C759',
-  },
-  connectionDotDisconnected: {
-    backgroundColor: '#FF3B30',
-  },
-  connectionText: {
-    fontSize: 14,
-    color: '#666',
-  },
-  errorContainer: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    backgroundColor: '#ffebee',
-  },
-  listContainer: {
-    padding: 16,
-  },
+  headerTitle: { fontSize: 24, fontWeight: 'bold', color: '#333' },
+  headerSubtitle: { fontSize: 14, color: '#666', marginTop: 2 },
+  logoutButton: { paddingHorizontal: 16, paddingVertical: 8, borderRadius: 6, borderWidth: 1, borderColor: '#007AFF' },
+  logoutButtonText: { color: '#007AFF', fontSize: 14, fontWeight: '600' },
+
+  connectionStatus: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#fff' },
+  connectionDot: { width: 8, height: 8, borderRadius: 4, marginRight: 8 },
+  connectionDotConnected: { backgroundColor: '#34C759' },
+  connectionDotDisconnected: { backgroundColor: '#FF3B30' },
+  connectionText: { fontSize: 14, color: '#666' },
+
+  errorContainer: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: '#ffebee' },
+
+  listContainer: { padding: 16 },
   userItem: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -448,73 +502,27 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 2,
   },
-  userInfo: {
-    flex: 1,
-  },
-  userEmail: {
-    fontSize: 16,
-    fontWeight: '500',
-    color: '#333',
-  },
-  statusBadge: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 12,
-  },
-  statusOnline: {
-    backgroundColor: '#d4edda',
-  },
-  statusOffline: {
-    backgroundColor: '#f8d7da',
-  },
-  statusText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#333',
-  },
-  emptyContainer: {
-    padding: 32,
-    alignItems: 'center',
-  },
-  emptyText: {
-    fontSize: 16,
-    color: '#999',
-  },
-  loadingMore: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 16,
-  },
-  loadingMoreText: {
-    marginLeft: 8,
-    fontSize: 14,
-    color: '#666',
-  },
-  loadMoreButton: {
-    padding: 16,
-    alignItems: 'center',
-  },
-  loadMoreText: {
-    fontSize: 14,
-    color: '#007AFF',
-    fontWeight: '600',
-  },
-  endOfListText: {
-    textAlign: 'center',
-    padding: 16,
-    fontSize: 14,
-    color: '#999',
-  },
-  footer: {
-    padding: 16,
-    backgroundColor: '#fff',
-    borderTopWidth: 1,
-    borderTopColor: '#e0e0e0',
-  },
-  footerText: {
-    fontSize: 12,
-    color: '#999',
-    textAlign: 'center',
-  },
+  userInfo: { flex: 1 },
+  userEmail: { fontSize: 16, fontWeight: '500', color: '#333' },
+
+  // debugText: { marginTop: 4, fontSize: 11, color: '#777' },
+
+  statusBadge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12 },
+  statusOnline: { backgroundColor: '#d4edda' },
+  statusActive: { backgroundColor: '#fff3cd' }, // "active recently"
+  statusOffline: { backgroundColor: '#f8d7da' },
+  statusUnknown: { backgroundColor: '#eee' },
+  statusText: { fontSize: 12, fontWeight: '600', color: '#333' },
+
+  emptyContainer: { padding: 32, alignItems: 'center' },
+  emptyText: { fontSize: 16, color: '#999' },
+
+  loadingMore: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', padding: 16 },
+  loadingMoreText: { marginLeft: 8, fontSize: 14, color: '#666' },
+  loadMoreButton: { padding: 16, alignItems: 'center' },
+  loadMoreText: { fontSize: 14, color: '#007AFF', fontWeight: '600' },
+  endOfListText: { textAlign: 'center', padding: 16, fontSize: 14, color: '#999' },
+
+  footer: { padding: 16, backgroundColor: '#fff', borderTopWidth: 1, borderTopColor: '#e0e0e0' },
+  footerText: { fontSize: 12, color: '#999', textAlign: 'center' },
 });

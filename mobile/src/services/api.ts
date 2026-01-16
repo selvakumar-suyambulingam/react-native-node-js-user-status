@@ -71,6 +71,18 @@ export async function getUsers(
   }
 }
 
+export async function getPresenceBatch(emails: string[]) {
+  const res = await fetch(`${config.apiBaseUrl}/users/presence`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ emails }),
+  });
+
+  if (!res.ok) throw new Error('presence batch failed');
+  const json = await res.json();
+  return json.users;
+}
+
 /**
  * Get presence for specific users - SCALABLE.
  * Use this when you have a contacts list and want their presence.
