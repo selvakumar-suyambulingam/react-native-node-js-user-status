@@ -59,17 +59,13 @@ export class PresenceService {
     return `presence:active:${email}`; // ms timestamp
   }
 
-  // Pub/Sub sharding for presence flips
-  presenceFlipChannel(email) {
-    const shardCount = config.presenceShardCount ?? 64;
+  // Watcher registry for targeted fanout (1M-scale)
+  watchersKey(email) {
+    return `presence:watchers:${email}`; // SET(serverId)
+  }
 
-    // Fast deterministic shard (no crypto)
-    let h = 0;
-    for (let i = 0; i < email.length; i++) {
-      h = (h * 31 + email.charCodeAt(i)) >>> 0;
-    }
-    const shard = h % shardCount;
-    return `presence:flip:${shard}`;
+  serverChannel(serverId) {
+    return `presence:server:${serverId}`;
   }
 
   bucketize(nowMs, lastActiveAtMs, online) {
@@ -97,15 +93,61 @@ export class PresenceService {
   // ---------------- Pub/Sub (presence flips only) ----------------
   async publishPresenceFlip(email, online) {
     const normalized = this.normalizeEmail(email);
-    const channel = this.presenceFlipChannel(normalized);
 
-    const msg = JSON.stringify({
-      email: normalized,
-      online,
-      ts: Date.now(),
-    });
+    // Targeted delivery: only publish to WS servers that currently have watchers
+    // for this email. This avoids broadcasting flips to every node.
+    const watchers = await this.client.sMembers(this.watchersKey(normalized));
+    if (!watchers || watchers.length === 0) return;
 
-    await this.pubClient.publish(channel, msg);
+    const msg = JSON.stringify({ email: normalized, online, ts: Date.now() });
+
+    // Publish to each server's dedicated channel.
+    // Note: Redis PUBLISH is fire-and-forget; correctness comes from snapshot pulls.
+    const pipeline = this.pubClient.multi();
+    for (const serverId of watchers) {
+      if (!serverId) continue;
+      pipeline.publish(this.serverChannel(serverId), msg);
+    }
+    await pipeline.exec();
+  }
+
+  /**
+   * Register that this WS server is watching these emails.
+   * Stored in Redis so publishPresenceFlip can target only relevant servers.
+   */
+  async registerWatchers(emails, serverId) {
+    if (!emails || emails.length === 0) return;
+    if (!serverId) return;
+
+    const ttlSeconds = config.watchersTtlSeconds ?? 120;
+    const pipeline = this.client.multi();
+
+    for (const email of emails) {
+      const normalized = this.normalizeEmail(email);
+      if (!this.isValidEmail(normalized)) continue;
+      const key = this.watchersKey(normalized);
+      pipeline.sAdd(key, serverId);
+      pipeline.expire(key, ttlSeconds);
+    }
+
+    await pipeline.exec();
+  }
+
+  /**
+   * Unregister this WS server for these emails.
+   * Called when the last local watcher for an email disappears.
+   */
+  async unregisterWatchers(emails, serverId) {
+    if (!emails || emails.length === 0) return;
+    if (!serverId) return;
+
+    const pipeline = this.client.multi();
+    for (const email of emails) {
+      const normalized = this.normalizeEmail(email);
+      if (!this.isValidEmail(normalized)) continue;
+      pipeline.sRem(this.watchersKey(normalized), serverId);
+    }
+    await pipeline.exec();
   }
 
   // ---------------- Presence (TTL truth + ownership) ----------------

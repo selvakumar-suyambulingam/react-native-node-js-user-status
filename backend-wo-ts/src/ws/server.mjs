@@ -72,21 +72,19 @@ export class PresenceWebSocketServer {
       this.subClient.on('error', (err) => console.error('Redis sub error:', err));
       await this.subClient.connect();
 
-      const shardCount = config.presenceShardCount ?? 64;
+      // 1M-scale: subscribe ONLY to this server's channel.
+      // PresenceService publishes flips to the server(s) that have active watchers.
+      const channel = `presence:server:${this.serverId}`;
+      await this.subClient.subscribe(channel, (message) => {
+        try {
+          const data = JSON.parse(message);
+          this.onPresenceFlip(data);
+        } catch (e) {
+          console.error('Failed to parse presence flip:', e);
+        }
+      });
 
-      for (let shard = 0; shard < shardCount; shard++) {
-        const channel = `presence:flip:${shard}`;
-        await this.subClient.subscribe(channel, (message) => {
-          try {
-            const data = JSON.parse(message);
-            this.onPresenceFlip(data);
-          } catch (e) {
-            console.error('Failed to parse presence flip:', e);
-          }
-        });
-      }
-
-      console.log(`Subscribed to ${shardCount} presence flip shards`);
+      console.log(`Subscribed to targeted presence channel: ${channel}`);
     } catch (e) {
       console.error('Failed to start flip listener:', e);
     }
@@ -309,6 +307,14 @@ export class PresenceWebSocketServer {
       this.focusedSocketsByEmail.get(email).add(ws);
     }
 
+    // Register this server as a watcher for targeted flip routing.
+    // (Only the WS servers watching an email will receive its flips.)
+    try {
+      await presenceService.registerWatchers(toAdd, this.serverId);
+    } catch (e) {
+      console.error('registerWatchers failed:', e);
+    }
+
     // Snapshot for focused emails so UI can update instantly
     // (this is still pull, but fast because it's Redis pipeline)
     const statuses = await presenceService.getBatchPresenceForList(toAdd);
@@ -329,6 +335,7 @@ export class PresenceWebSocketServer {
       return;
     }
 
+    const toUnregister = [];
     for (const email of emails) {
       const normalized = presenceService.normalizeEmail(email);
       if (!set.has(normalized)) continue;
@@ -338,11 +345,23 @@ export class PresenceWebSocketServer {
       const watchers = this.focusedSocketsByEmail.get(normalized);
       if (watchers) {
         watchers.delete(ws);
-        if (watchers.size === 0) this.focusedSocketsByEmail.delete(normalized);
+        if (watchers.size === 0) {
+          this.focusedSocketsByEmail.delete(normalized);
+          toUnregister.push(normalized);
+        }
       }
     }
 
     if (set.size === 0) this.focusedBySocket.delete(ws);
+
+    // Unregister server only for emails that no longer have ANY local watchers.
+    if (toUnregister.length > 0) {
+      try {
+        await presenceService.unregisterWatchers(toUnregister, this.serverId);
+      } catch (e) {
+        console.error('unregisterWatchers failed:', e);
+      }
+    }
 
     ws.send(JSON.stringify({ type: 'presence:blur:ok' }));
   }
@@ -355,11 +374,23 @@ export class PresenceWebSocketServer {
     // remove focus mappings
     const focused = this.focusedBySocket.get(ws);
     if (focused && focused.size > 0) {
+      const toUnregister = [];
       for (const email of focused) {
         const watchers = this.focusedSocketsByEmail.get(email);
         if (watchers) {
           watchers.delete(ws);
-          if (watchers.size === 0) this.focusedSocketsByEmail.delete(email);
+          if (watchers.size === 0) {
+            this.focusedSocketsByEmail.delete(email);
+            toUnregister.push(email);
+          }
+        }
+      }
+
+      if (toUnregister.length > 0) {
+        try {
+          await presenceService.unregisterWatchers(toUnregister, this.serverId);
+        } catch (e) {
+          console.error('unregisterWatchers(disconnect) failed:', e);
         }
       }
     }
